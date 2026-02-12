@@ -1,0 +1,607 @@
+mport re
+from typing import Optional
+
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+from datetime import date
+from snowflake.snowpark.context import get_active_session
+
+# ============================================================
+# CONFIG
+# ============================================================
+DT_TABLE_FQN = "RESTAURANT_ANALYTICS_DB.SEMANTIC.DT_ORDER_ANALYTICS"
+RAG_CONTEXT_TABLE_FQN = "RESTAURANT_ANALYTICS_DB.SEMANTIC.RAG_CONTEXT"  # optional
+
+# Hidden model preference (NO UI option)
+MODEL_CANDIDATES = ["mistral-large", "mistral-large2", "claude-3.5-sonnet"]
+
+st.set_page_config(page_title="Restaurant Analytics", layout="wide")
+st.title("Restaurant Analytics Dashboard")
+
+session = get_active_session()
+
+# ============================================================
+# UTILS / HELPERS
+# ============================================================
+def esc_sql(v: str) -> str:
+    return v.replace("'", "''")
+
+@st.cache_data(ttl=3600)
+def run_sql_cached(sql: str) -> pd.DataFrame:
+    return session.sql(sql).to_pandas()
+
+def run_sql_live(sql: str) -> pd.DataFrame:
+    # Never cache Cortex calls
+    return session.sql(sql).to_pandas()
+
+@st.cache_data(ttl=3600)
+def get_dim_measures():
+    sql = f"""
+    SELECT COLUMN_NAME, DATA_TYPE
+    FROM RESTAURANT_ANALYTICS_DB.INFORMATION_SCHEMA.COLUMNS
+    WHERE TABLE_SCHEMA = 'SEMANTIC'
+      AND TABLE_NAME = 'DT_ORDER_ANALYTICS'
+    ORDER BY ORDINAL_POSITION
+    """
+    cols = run_sql_cached(sql)
+
+    dims, meas = [], []
+    numeric_markers = ["NUMBER", "INT", "INTEGER", "FLOAT", "DOUBLE", "DECIMAL", "NUMERIC"]
+    for _, r in cols.iterrows():
+        col = r["COLUMN_NAME"]
+        dtype = str(r["DATA_TYPE"]).upper()
+        if any(m in dtype for m in numeric_markers):
+            meas.append(col)
+        else:
+            dims.append(col)
+
+    # keep list sizes manageable for prompting
+    dims = dims[:30]
+    meas = meas[:20]
+    return dims, meas
+
+@st.cache_data(ttl=3600)
+def get_rag_context(max_rows: int = 30) -> str:
+    # Optional RAG_CONTEXT
+    try:
+        rag_df = run_sql_cached(f"SELECT * FROM {RAG_CONTEXT_TABLE_FQN} LIMIT {max_rows}")
+        if not rag_df.empty:
+            return " ".join(rag_df.iloc[:, 0].astype(str).tolist())
+    except Exception:
+        pass
+
+    # Fallback DOCS_REPOSITORY
+    try:
+        docs_df = run_sql_cached(f"""
+            SELECT DOC_TYPE, SUBJECT, CONTENT
+            FROM {DOCS_REPO_FQN}
+            LIMIT {max_rows}
+        """)
+        if not docs_df.empty:
+            joined = []
+            for _, r in docs_df.iterrows():
+                joined.append(f"Source[DocType={r['DOC_TYPE']}, Subject={r['SUBJECT']}]: {r['CONTENT']}")
+            return "\n\n".join(joined)
+    except Exception:
+        pass
+
+    return ""
+
+def sanitize_sql(text: str) -> str:
+    if not text:
+        return ""
+    s = text.replace("```sql", "").replace("```", "").strip()
+    low = s.lower()
+    if "select" in low:
+        s = s[low.find("select"):]
+    return s.strip()
+
+# ---------- NLQ LIMIT HELPERS ----------
+DEFAULT_LIMIT = 100  # small, safe default when no 'top N' or explicit limit is found
+
+def extract_requested_limit(text: str) -> Optional[int]:
+    """
+    Detects 'top N', 'bottom N', or 'limit N' in the user's question (or any text).
+    Returns N as int if found; otherwise None.
+    """
+    if not text:
+        return None
+    t = text.lower()
+
+    m = re.search(r'\btop\s+(\d{1,4})\b', t)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r'\bbottom\s+(\d{1,4})\b', t)
+    if m:
+        return int(m.group(1))
+
+    m = re.search(r'\blimit\s+(\d{1,4})\b', t)
+    if m:
+        return int(m.group(1))
+
+    return None
+
+def has_any_limit(sql_text: str) -> bool:
+    if not sql_text:
+        return False
+    return bool(
+        re.search(r'\blimit\s+\d+\b', sql_text, flags=re.I) or
+        re.search(r'fetch\s+first\s+\d+\s+rows\s+only', sql_text, flags=re.I) or
+        re.search(r'^\s*select\s+top\s+\d+\s+', sql_text, flags=re.I)
+    )
+
+def apply_or_adjust_limit(sql_text: str, desired_limit: int) -> str:
+    """
+    If SQL already has a LIMIT/FETCH/TOP with any value, replace it with desired_limit.
+    If it has no limit, append LIMIT desired_limit.
+    """
+    if not sql_text:
+        return sql_text
+
+    s = sql_text.strip()
+
+    # Replace FETCH FIRST n ROWS ONLY
+    if re.search(r'fetch\s+first\s+\d+\s+rows\s+only', s, flags=re.I):
+        s = re.sub(r'(fetch\s+first\s+)\d+(\s+rows\s+only)', rf'\g<1>{desired_limit}\g<2>', s, flags=re.I)
+        return s
+
+    # Replace LIMIT n
+    if re.search(r'\blimit\s+\d+\b', s, flags=re.I):
+        s = re.sub(r'(\blimit\s+)\d+\b', rf'\g<1>{desired_limit}', s, flags=re.I)
+        return s
+
+    # Replace SELECT TOP n
+    if re.search(r'^\s*select\s+top\s+\d+\s+', s, flags=re.I):
+        s = re.sub(r'(^\s*select\s+top\s+)\d+(\s+)', rf'\g<1>{desired_limit}\g<2>', s, flags=re.I)
+        return s
+
+    # No limit found — append one
+    s = s.rstrip().rstrip(';')
+    s += f" LIMIT {desired_limit}"
+    return s
+
+def ensure_limit(sql_text: str, requested_limit: Optional[int] = None) -> str:
+    """
+    - If requested_limit provided: enforce that limit (replace or add).
+    - Else if SQL already has some limit/fetch/top: keep it as is.
+    - Else add DEFAULT_LIMIT.
+    """
+    if not sql_text:
+        return sql_text
+
+    s = sql_text.strip()
+
+    if requested_limit is not None:
+        return apply_or_adjust_limit(s, requested_limit)
+
+    if has_any_limit(s):
+        return s
+
+    # No requested limit and no limit in SQL → add default
+    s = s.rstrip(';') + f" LIMIT {DEFAULT_LIMIT}"
+    return s
+# ---------------------------------------
+
+def is_safe_sql(sql_text: str) -> bool:
+    if not sql_text:
+        return False
+    up = sql_text.upper()
+    if not up.startswith("SELECT"):
+        return False
+    if DT_TABLE_FQN.upper() not in up:
+        return False
+    blocked = [" RAW.", " CLEANED.", " DW."]
+    if any(b in up for b in blocked):
+        return False
+    bad = ["INSERT", "UPDATE", "DELETE", "MERGE", "CREATE", "DROP", "ALTER", "TRUNCATE", "GRANT", "REVOKE"]
+    if any(w in up for w in bad):
+        return False
+    return True
+
+def cortex_model_works(model: str) -> bool:
+    try:
+        _ = run_sql_live(f"SELECT SNOWFLAKE.CORTEX.COMPLETE('{model}', 'OK') AS X")
+        return True
+    except Exception:
+        return False
+
+def pick_model() -> str:
+    # No UI option — auto-pick first working model
+    for m in MODEL_CANDIDATES:
+        if cortex_model_works(m):
+            return m
+    return MODEL_CANDIDATES[-1]
+
+def cortex_generate_sql(model: str, prompt: str) -> str:
+    sql_stmt = f"""
+    SELECT SNOWFLAKE.CORTEX.COMPLETE(
+      '{model}',
+      $$ {esc_sql(prompt)} $$
+    ) AS GENERATED_SQL
+    """
+    out = run_sql_live(sql_stmt)
+    if out.empty:
+        return ""
+    return str(out.iloc[0]["GENERATED_SQL"] or "")
+
+def cortex_repair_to_select(model: str, bad_output: str) -> str:
+    # Do not force a specific LIMIT here; post-processing will enforce the correct limit.
+    fix_prompt = f"""
+You are a Snowflake SQL generator.
+Return ONLY ONE valid SELECT statement that runs on:
+{DT_TABLE_FQN}
+
+RULES:
+- Use only {DT_TABLE_FQN}
+- SELECT only
+- Aggregations must be grouped correctly
+- Output SQL only
+
+Text to convert:
+{bad_output}
+"""
+    return cortex_generate_sql(model, fix_prompt)
+
+# ============================================================
+# FORMATTING (₹ helpers)
+# ============================================================
+RUPEE = "₹"
+
+def format_currency(value: float) -> str:
+    """Format floats as Indian Rupee with grouping."""
+    try:
+        return f"{RUPEE}{value:,.2f}"
+    except Exception:
+        return f"{RUPEE}{value}"
+
+def add_rupee_axis(fig, axis: str = "y"):
+    """
+    Add ₹ prefix to axes ticks for Plotly charts.
+    axis: 'y' or 'x'
+    """
+    if axis == "y":
+        fig.update_yaxes(tickprefix=f"{RUPEE} ", separatethousands=True)
+    else:
+        fig.update_xaxes(tickprefix=f"{RUPEE} ", separatethousands=True)
+    return fig
+
+# Set a neutral Plotly template
+px.defaults.template = "plotly_white"
+
+# ============================================================
+# SIDEBAR NAVIGATION (Explorer removed)
+# ============================================================
+page = st.sidebar.radio(
+    "Navigate",
+    ["Executive Summary", "Menu Performance", "Restaurant Performance", "Cortex NLQ"]
+)
+
+# ============================================================
+# FILTERS
+# ============================================================
+st.sidebar.markdown("## Filters")
+
+date_bounds = run_sql_cached(f"""
+SELECT MIN(DATE_VALUE) AS MIN_DATE, MAX(DATE_VALUE) AS MAX_DATE
+FROM {DT_TABLE_FQN}
+""")
+min_date = date_bounds.iloc[0]["MIN_DATE"]
+max_date = date_bounds.iloc[0]["MAX_DATE"]
+
+default_start = min_date if pd.notna(min_date) else date.today()
+default_end = max_date if pd.notna(max_date) else date.today()
+
+date_range = st.sidebar.date_input("Date Range", value=(default_start, default_end))
+
+regions = run_sql_cached(f"SELECT DISTINCT REGION FROM {DT_TABLE_FQN} WHERE REGION IS NOT NULL ORDER BY 1")["REGION"].tolist()
+restaurants = run_sql_cached(f"SELECT DISTINCT RESTAURANT_NAME FROM {DT_TABLE_FQN} WHERE RESTAURANT_NAME IS NOT NULL ORDER BY 1")["RESTAURANT_NAME"].tolist()
+cuisines = run_sql_cached(f"SELECT DISTINCT CUISINE FROM {DT_TABLE_FQN} WHERE CUISINE IS NOT NULL ORDER BY 1")["CUISINE"].tolist()
+tiers = run_sql_cached(f"SELECT DISTINCT LOYALTY_TIER FROM {DT_TABLE_FQN} WHERE LOYALTY_TIER IS NOT NULL ORDER BY 1")["LOYALTY_TIER"].tolist()
+channels = run_sql_cached(f"SELECT DISTINCT ORDER_CHANNEL FROM {DT_TABLE_FQN} WHERE ORDER_CHANNEL IS NOT NULL ORDER BY 1")["ORDER_CHANNEL"].tolist()
+
+region_sel = st.sidebar.selectbox("Region", ["All"] + regions)
+restaurant_sel = st.sidebar.selectbox("Restaurant", ["All"] + restaurants)
+cuisine_sel = st.sidebar.selectbox("Cuisine", ["All"] + cuisines)
+tier_sel = st.sidebar.selectbox("Loyalty Tier", ["All"] + tiers)
+channel_sel = st.sidebar.selectbox("Order Channel", ["All"] + channels)
+
+def build_where(include=None):
+    if include is None:
+        include = {"date", "region", "restaurant", "cuisine", "tier", "channel"}
+    clauses = []
+    if "date" in include and isinstance(date_range, tuple) and len(date_range) == 2:
+        start_dt, end_dt = date_range
+        clauses.append(f"DATE_VALUE BETWEEN '{start_dt}' AND '{end_dt}'")
+    if "region" in include and region_sel != "All":
+        clauses.append(f"REGION = '{esc_sql(region_sel)}'")
+    if "restaurant" in include and restaurant_sel != "All":
+        clauses.append(f"RESTAURANT_NAME = '{esc_sql(restaurant_sel)}'")
+    if "cuisine" in include and cuisine_sel != "All":
+        clauses.append(f"CUISINE = '{esc_sql(cuisine_sel)}'")
+    if "tier" in include and tier_sel != "All":
+        clauses.append(f"LOYALTY_TIER = '{esc_sql(tier_sel)}'")
+    if "channel" in include and channel_sel != "All":
+        clauses.append(f"ORDER_CHANNEL = '{esc_sql(channel_sel)}'")
+    where = " AND ".join(clauses)
+    return f"WHERE {where}" if where else ""
+
+# ============================================================
+# PAGES
+# ============================================================
+
+# =========================
+# Executive Summary
+# =========================
+if page == "Executive Summary":
+    st.subheader("Executive Summary")
+
+    where_sql = build_where()
+
+    sql = f"""
+    SELECT DATE_VALUE, REGION, RESTAURANT_NAME,
+           SUM(NET_AMOUNT) AS REVENUE,
+           COUNT(DISTINCT ORDER_ID) AS ORDERS,
+           DIV0(SUM(NET_AMOUNT), COUNT(DISTINCT ORDER_ID)) AS AOV
+    FROM {DT_TABLE_FQN}
+    {where_sql}
+    GROUP BY DATE_VALUE, REGION, RESTAURANT_NAME
+    ORDER BY DATE_VALUE
+    """
+    df = run_sql_cached(sql)
+
+    if df.empty:
+        st.warning("No data found for the selected filters.")
+    else:
+        total_revenue = float(df["REVENUE"].sum())
+        total_orders = float(df["ORDERS"].sum())
+        aov = (total_revenue / total_orders) if total_orders else 0.0
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Revenue", format_currency(total_revenue))
+        c2.metric("Orders", f"{int(total_orders):,}")
+        c3.metric("AOV", format_currency(aov))
+
+        st.markdown("### Revenue by Region")
+        by_region = df.groupby("REGION", as_index=False)["REVENUE"].sum().sort_values("REVENUE", ascending=False)
+        fig = px.bar(by_region, x="REGION", y="REVENUE")
+        fig = add_rupee_axis(fig, "y")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Top Restaurants (Revenue)")
+        by_rest = (
+            df.groupby("RESTAURANT_NAME", as_index=False)["REVENUE"]
+            .sum()
+            .sort_values("REVENUE", ascending=False)
+            .head(15)
+        )
+        fig = px.bar(by_rest, x="REVENUE", y="RESTAURANT_NAME", orientation="h")
+        fig = add_rupee_axis(fig, "x")
+        st.plotly_chart(fig, use_container_width=True)
+
+# =========================
+# Menu Performance
+# =========================
+elif page == "Menu Performance":
+    st.subheader("Menu Performance")
+
+    where_sql = build_where(include={"date", "cuisine"})  # menu-focused filter
+
+    sql = f"""
+    SELECT DATE_VALUE, CUISINE, ITEM_NAME, QTY, NET_AMOUNT
+    FROM {DT_TABLE_FQN}
+    {where_sql}
+    """
+    df = run_sql_cached(sql)
+
+    if df.empty:
+        st.warning("No data found for the selected filters.")
+    else:
+        st.markdown("### Top Items by Revenue")
+        top_items = (
+            df.groupby(["CUISINE", "ITEM_NAME"], as_index=False)["NET_AMOUNT"]
+            .sum()
+            .rename(columns={"NET_AMOUNT": "REVENUE"})
+            .sort_values("REVENUE", ascending=False)
+            .head(15)
+        )
+        fig = px.bar(top_items, x="REVENUE", y="ITEM_NAME", color="CUISINE", orientation="h")
+        fig = add_rupee_axis(fig, "x")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Cuisine Mix (Revenue Share)")
+        cuisine_mix = df.groupby("CUISINE", as_index=False)["NET_AMOUNT"].sum().rename(columns={"NET_AMOUNT": "REVENUE"})
+        fig = px.pie(cuisine_mix, names="CUISINE", values="REVENUE", hole=0.0)
+        fig.update_traces(hovertemplate=f"%{{label}}: {RUPEE}%{{value:,.2f}} (%{{percent}})")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Item Contribution (Top 15)")
+        total_rev = float(cuisine_mix["REVENUE"].sum()) if not cuisine_mix.empty else 0.0
+        contrib = top_items.copy()
+        contrib["CONTRIBUTION_PCT"] = (contrib["REVENUE"] / total_rev * 100).round(2) if total_rev else 0.0
+
+        # Replace table with a simple bullet list for business users
+        # e.g., "Paneer Tikka (North Indian): ₹1,234,567.00 — 12.34%"
+        lines = []
+        for _, r in contrib.iterrows():
+            item = str(r["ITEM_NAME"])
+            cui = str(r["CUISINE"])
+            rev = format_currency(float(r["REVENUE"]))
+            pct = f"{float(r['CONTRIBUTION_PCT']):,.2f}%" if total_rev else "0.00%"
+            lines.append(f"- **{item}** ({cui}): {rev} — {pct}")
+        st.markdown("\n".join(lines) if lines else "_No top items available_")
+
+# =========================
+# Restaurant Performance
+# =========================
+elif page == "Restaurant Performance":
+    st.subheader("Restaurant Performance")
+
+    where_sql = build_where(include={"date", "region", "restaurant"})
+
+    sql = f"""
+    SELECT DATE_VALUE, REGION, RESTAURANT_NAME, NET_AMOUNT, ORDER_ID
+    FROM {DT_TABLE_FQN}
+    {where_sql}
+    """
+    df = run_sql_cached(sql)
+
+    if df.empty:
+        st.warning("No data found for the selected filters.")
+    else:
+        perf = df.groupby(["DATE_VALUE", "REGION", "RESTAURANT_NAME"], as_index=False).agg(
+            REVENUE=("NET_AMOUNT", "sum"),
+            ORDERS=("ORDER_ID", "nunique")
+        )
+
+        st.markdown("### Revenue by Restaurant (Top 15)")
+        top_rest = (
+            perf.groupby(["REGION", "RESTAURANT_NAME"], as_index=False)["REVENUE"]
+            .sum()
+            .sort_values("REVENUE", ascending=False)
+            .head(15)
+        )
+        fig = px.bar(top_rest, x="REVENUE", y="RESTAURANT_NAME", color="REGION", orientation="h")
+        fig = add_rupee_axis(fig, "x")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Region Comparison")
+        region_cmp = perf.groupby("REGION", as_index=False)["REVENUE"].sum().sort_values("REVENUE", ascending=False)
+        fig = px.bar(region_cmp, x="REGION", y="REVENUE")
+        fig = add_rupee_axis(fig, "y")
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.markdown("### Peak Days (Highest Revenue Days)")
+        peak = perf.groupby("DATE_VALUE", as_index=False)["REVENUE"].sum().sort_values("REVENUE", ascending=False).head(10)
+        fig = px.bar(peak, x="DATE_VALUE", y="REVENUE")
+        fig = add_rupee_axis(fig, "y")
+        st.plotly_chart(fig, use_container_width=True)
+
+# =========================
+# Cortex NLQ (Governed)
+# =========================
+else:
+    st.subheader("Cortex NLQ (Governed)")
+
+    question = st.text_input("Ask a business question", placeholder="Revenue by cuisine last month")
+
+    def compact_df_for_llm(df: pd.DataFrame, max_rows: int = 50, max_cols: int = 10) -> str:
+        """
+        Convert the top-left corner of a dataframe into compact JSON lines for LLM consumption.
+        Keeps token size small and schema clear.
+        """
+        if df is None or df.empty:
+            return "[]"
+        take_cols = list(df.columns[:max_cols])
+        mini = df[take_cols].head(max_rows).copy()
+
+        # Convert numpy/decimal/timestamps to string-safe values
+        def _cast(v):
+            if pd.isna(v):
+                return None
+            if isinstance(v, (float, int)):
+                return float(v)
+            return str(v)
+        records = [{c: _cast(v) for c, v in row.items()} for row in mini.to_dict(orient="records")]
+        import json
+        return json.dumps(records, ensure_ascii=False)
+
+    def summarize_for_business(model: str, question: str, data_json: str, rag_text: str) -> str:
+        """
+        Ask Cortex to produce a short, business-facing narrative using the query,
+        the compact result JSON, and optional RAG context.
+        """
+        guidance = f"""
+You are a business analyst. Write a short, plain-English answer for executives.
+
+INPUTS:
+- Question: {question}
+- Result JSON (sampled rows): {data_json}
+- Context (optional): {rag_text}
+
+GUIDELINES:
+- Be concise and clear (4–8 sentences).
+- Start with the direct answer first, then 1–3 key drivers or splits (e.g., by region/cuisine/channel) if evident.
+- Use Indian Rupee formatting where monetary values are apparent (₹ and comma grouping).
+- Avoid SQL, code, or column names unless essential.
+- If data is insufficient or empty, say so plainly and suggest a next best question.
+"""
+        return cortex_generate_sql(model, guidance).strip()
+
+    if question:
+        dims, meas = get_dim_measures()
+        dim_cols = ", ".join(dims)
+        meas_cols = ", ".join(meas)
+
+        model = pick_model()  # hidden auto selection
+        rag_text = get_rag_context(max_rows=20) or ""  # optional grounding
+
+        prompt = f"""
+You are an expert Snowflake SQL generator.
+
+Table:
+{DT_TABLE_FQN}
+
+Dimensions (choose relevant only):
+{dim_cols}
+
+Measures (choose relevant only):
+{meas_cols}
+
+STRICT RULES:
+- Use ONLY table {DT_TABLE_FQN}
+- Measures MUST be aggregated
+- Dimensions must be grouped if selected
+- Generate ONLY ONE SELECT statement
+- Use DATE_VALUE for date filtering when time range is mentioned
+- Include an appropriate LIMIT based on the question:
+  - If the question asks for "top N" or "bottom N", use LIMIT N
+  - Otherwise, choose a reasonable LIMIT to keep results small
+- Output SQL only (no explanation)
+
+Question:
+{question}
+"""
+
+        with st.spinner("Thinking with Cortex…"):
+            raw_out = cortex_generate_sql(model, prompt)
+
+        clean_sql = sanitize_sql(raw_out)
+        if not clean_sql or not clean_sql.lower().startswith("select"):
+            repaired = cortex_repair_to_select(model, raw_out)
+            clean_sql = sanitize_sql(repaired)
+
+        # Respect 'top N/bottom N/limit N' intent, otherwise add a small default
+        requested_limit = extract_requested_limit(question)
+        clean_sql = ensure_limit(clean_sql, requested_limit)
+
+        if not clean_sql:
+            st.error("Sorry, I couldn’t generate a valid query for that. Try rephrasing.")
+        elif not is_safe_sql(clean_sql):
+            st.error("This question produced an unsafe query. Please try a simpler phrasing.")
+        else:
+            # Execute and then summarize — do NOT display SQL or any table
+            result_df = run_sql_cached(clean_sql)
+
+            if result_df.empty:
+                st.info("I didn’t find matching data for the selected filters/date range.")
+            else:
+                # Prepare compact JSON snapshot for summarization
+                data_json = compact_df_for_llm(result_df, max_rows=60, max_cols=12)
+
+                # Ask Cortex to write an exec-friendly narrative
+                with st.spinner("Summarizing results…"):
+                    summary = summarize_for_business(model, question, data_json, rag_text)
+
+                st.markdown("### Answer")
+                st.write(summary)
+``
+
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+--------------------------------------------------------------------------
+
+
+
+
